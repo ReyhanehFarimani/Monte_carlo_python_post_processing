@@ -392,3 +392,12 @@ def plot_g6_curve(r, g6,
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
     return fig, ax
+
+
+def plot_density_histogram(ax, rho_map, bins=100):
+    vals = rho_map.ravel()
+    vals = vals[np.isfinite(vals)]
+    ax.hist(vals, bins=bins, density=True, alpha=0.75, color='C0')
+    ax.set_xlabel(r'local density $\rho$')
+    ax.set_ylabel('PDF')
+    ax.grid(True)

@@ -714,3 +714,384 @@ def compute_g6(all_positions, box_length, r_max=None, nbins=120, return_per_fram
         nbins=int(nbins),
         return_per_frame=bool(return_per_frame),
     )
+
+
+# =============================================================================
+# NVT local-density bimodality detector (periodic coarse-graining + GMM)
+# =============================================================================
+import numpy as np
+from dataclasses import dataclass
+from typing import Tuple, Dict, Optional
+
+from numpy.fft import rfftn, irfftn
+from scipy.special import erf
+from sklearn.mixture import GaussianMixture  # optional dependency: deterministic with random_state
+
+@dataclass
+class BimodalityResult:
+    bimodal: bool
+    w_min: float                  # min component weight
+    dprime: float                 # separation metric
+    mu_lo: float                  # lower-mean component (density)
+    mu_hi: float                  # higher-mean component (density)
+    sigma_lo: float               # std of low-density component
+    sigma_hi: float               # std of high-density component
+    rho_mean: float               # global mean density N/(Lx*Ly)
+    params: Dict[str, float]      # nbins, sigma (grid units), target_ppc, etc.
+
+# ---------- Helpers: CIC deposit under PBC ----------
+def _cic_deposit_pbc(positions_xy: np.ndarray, Lx: float, Ly: float, nx: int, ny: int) -> np.ndarray:
+    """
+    Cloud-in-cell mass deposit of N points onto an (nx,ny) grid with periodic BC.
+    Returns integer counts per cell (float array).
+    """
+    x = np.mod(positions_xy[:, 0], Lx) * (nx / Lx)
+    y = np.mod(positions_xy[:, 1], Ly) * (ny / Ly)
+
+    ix = np.floor(x).astype(int)
+    iy = np.floor(y).astype(int)
+    fx = x - ix
+    fy = y - iy
+
+    # neighbor indices with PBC
+    ix1 = (ix + 1) % nx
+    iy1 = (iy + 1) % ny
+
+    w00 = (1.0 - fx) * (1.0 - fy)
+    w10 = fx * (1.0 - fy)
+    w01 = (1.0 - fx) * fy
+    w11 = fx * fy
+
+    H = np.zeros((ny, nx), dtype=np.float64)  # (row=y, col=x)
+    # scatter-add
+    np.add.at(H, (iy, ix), w00)
+    np.add.at(H, (iy, ix1), w10)
+    np.add.at(H, (iy1, ix), w01)
+    np.add.at(H, (iy1, ix1), w11)
+    return H
+
+# ---------- Gaussian blur under PBC via FFT ----------
+def _gaussian_kernel_fourier(nx: int, ny: int, sigma_x: float, sigma_y: float) -> np.ndarray:
+    """
+    Fourier-space Gaussian for real-FFT layout (rfftn). sigma_* in grid cells.
+    """
+    ky = np.fft.fftfreq(ny)[:, None]  # shape (ny,1), cycles per sample
+    kx = np.fft.rfftfreq(nx)[None, :] # shape (1,nx//2+1)
+    # Convert to angular frequencies: 2π * cycles
+    wy2 = (2.0 * np.pi * ky) ** 2
+    wx2 = (2.0 * np.pi * kx) ** 2
+    # Fourier of Gaussian: exp(-0.5 * (σx^2 kx^2 + σy^2 ky^2))
+    Gk = np.exp(-0.5 * (sigma_x**2 * wx2 + sigma_y**2 * wy2))
+    return Gk
+
+def _blur_pbc_fft(field: np.ndarray, sigma_x: float, sigma_y: float) -> np.ndarray:
+    """
+    Convolve 'field' with a separable Gaussian under periodic BC using FFTs.
+    sigma_* are in grid cells (not physical units).
+    """
+    fk = rfftn(field, s=field.shape)
+    Gk = _gaussian_kernel_fourier(field.shape[1], field.shape[0], sigma_x, sigma_y)
+    out = irfftn(fk * Gk, s=field.shape)
+    return out
+
+# ---------- Main construction: ρ(x,y) on a grid ----------
+def coarse_grained_density_pbc(positions_xy: np.ndarray,
+                               box_length: Tuple[float, float],
+                               nbins: Optional[Tuple[int, int]] = None,
+                               sigma_phys: Optional[float] = None,
+                               target_particles_per_cell: int = 8) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
+    """
+    Construct coarse-grained density ρ(x,y) for an NVT snapshot using:
+      1) CIC deposit to counts grid H (periodic).
+      2) Gaussian blur with width sigma_phys (periodic).
+    Parameters
+    ----------
+    positions_xy : (N,2) float
+    box_length   : (Lx,Ly)
+    nbins        : (nx,ny). If None, auto-set for ~target_particles_per_cell on average.
+    sigma_phys   : Gaussian σ in *physical units*. If None, set σ = 0.6 * a, a = 1/sqrt(ρ).
+    target_particles_per_cell : average particles per cell used to pick grid if nbins is None.
+
+    Returns
+    -------
+    xedges, yedges, rho_map, info
+      rho_map has shape (ny,nx), with physical density units (#/area).
+    """
+    Lx, Ly = float(box_length[0]), float(box_length[1])
+    N = positions_xy.shape[0]
+    A = Lx * Ly
+    rho_mean = N / A
+
+    # grid selection
+    if nbins is None:
+        n_cells = max(N // max(1, target_particles_per_cell), 64)  # lower bound for resolution
+        aspect = Lx / Ly
+        nx = int(np.sqrt(n_cells * aspect))
+        ny = max(1, int(n_cells // max(nx, 1)))
+        # round to even numbers for FFT friendliness
+        nx = int(2 * np.ceil(nx / 2))
+        ny = int(2 * np.ceil(ny / 2))
+    else:
+        nx, ny = int(nbins[0]), int(nbins[1])
+
+    # CIC deposit
+    H = _cic_deposit_pbc(positions_xy, Lx, Ly, nx, ny)  # counts per cell
+
+    # Gaussian width
+    if sigma_phys is None:
+        a = 1.0 / np.sqrt(rho_mean)      # mean interparticle spacing
+        sigma_phys = 0.6 * a             # default: mildly smooth shot noise, keep interfaces sharp
+
+    # convert σ to grid cells along x,y
+    dx, dy = Lx / nx, Ly / ny
+    sigma_x = sigma_phys / dx
+    sigma_y = sigma_phys / dy
+
+    # periodic Gaussian blur
+    H_smooth = _blur_pbc_fft(H, sigma_x, sigma_y)
+
+    # Map to density: counts / cell_area
+    cell_area = dx * dy
+    rho_map = H_smooth / cell_area
+
+    xedges = np.linspace(0.0, Lx, nx + 1)
+    yedges = np.linspace(0.0, Ly, ny + 1)
+    info = dict(nx=float(nx), ny=float(ny),
+                dx=float(dx), dy=float(dy),
+                sigma_phys=float(sigma_phys),
+                sigma_x=float(sigma_x), sigma_y=float(sigma_y),
+                rho_mean=float(rho_mean),
+                target_ppc=float(target_particles_per_cell))
+    return xedges, yedges, rho_map, info
+
+# ---------- Objective bimodality test on ρ grid ----------
+def density_bimodality_gmm(rho_map: np.ndarray,
+                           min_weight: float = 0.10,
+                           min_dprime: float = 2.0) -> Tuple[bool, Dict[str, float]]:
+    """
+    Fit a 2-component Gaussian Mixture to the set {ρ(x,y)} (grid samples).
+    Declare 'bimodal' if:
+      - both component weights ≥ min_weight, and
+      - separation d' = |μ1-μ2| / sqrt(0.5(σ1^2+σ2^2)) ≥ min_dprime.
+    Returns (bimodal, diagnostics).
+    """
+    vals = rho_map.ravel().astype(np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size < 200:
+        return False, {"n": float(vals.size)}
+
+    X = vals.reshape(-1, 1)
+    gmm = GaussianMixture(n_components=2, covariance_type="full", random_state=0).fit(X)
+    w = gmm.weights_
+    mu = gmm.means_.ravel()
+    s2 = np.array([np.squeeze(c) for c in gmm.covariances_])
+    order = np.argsort(mu)
+    mu = mu[order]; s2 = s2[order]; w = w[order]
+
+    dprime = abs(mu[1] - mu[0]) / np.sqrt(0.5 * (s2[0] + s2[1]))
+    bimodal = (w.min() >= min_weight) and (dprime >= min_dprime)
+
+    diag = {
+        "w_min": float(w.min()),
+        "w_lo": float(w[0]),
+        "w_hi": float(w[1]),
+        "mu_lo": float(mu[0]),
+        "mu_hi": float(mu[1]),
+        "sigma_lo": float(np.sqrt(s2[0])),
+        "sigma_hi": float(np.sqrt(s2[1])),
+        "dprime": float(dprime),
+    }
+    return bool(bimodal), diag
+
+# ---------- Public API ----------
+def detect_liquid_gas_bimodality_nvt(positions_xy: np.ndarray,
+                                     box_length: Tuple[float, float],
+                                     nbins: Optional[Tuple[int, int]] = None,
+                                     sigma_phys: Optional[float] = None,
+                                     gmm_min_weight: float = 0.10,
+                                     gmm_min_dprime: float = 2.0,
+                                     target_particles_per_cell: int = 8) -> BimodalityResult:
+    """
+    End-to-end NVT detector:
+      - builds coarse-grained ρ(x,y) with periodic CIC + Gaussian blur,
+      - runs GMM test,
+      - returns a structured BimodalityResult.
+    """
+    xedges, yedges, rho_map, info = coarse_grained_density_pbc(
+        positions_xy, box_length, nbins=nbins, sigma_phys=sigma_phys,
+        target_particles_per_cell=target_particles_per_cell
+    )
+    bimodal, diag = density_bimodality_gmm(rho_map,
+                                           min_weight=gmm_min_weight,
+                                           min_dprime=gmm_min_dprime)
+    res = BimodalityResult(
+        bimodal=bimodal,
+        w_min=float(diag.get("w_min", 0.0)),
+        dprime=float(diag.get("dprime", 0.0)),
+        mu_lo=float(diag.get("mu_lo", np.nan)),
+        mu_hi=float(diag.get("mu_hi", np.nan)),
+        sigma_lo=float(diag.get("sigma_lo", np.nan)),
+        sigma_hi=float(diag.get("sigma_hi", np.nan)),
+        rho_mean=float(info["rho_mean"]),
+        params=dict(
+            nx=info["nx"], ny=info["ny"], dx=info["dx"], dy=info["dy"],
+            sigma_phys=info["sigma_phys"], sigma_x=info["sigma_x"], sigma_y=info["sigma_y"],
+            gmm_min_weight=float(gmm_min_weight), gmm_min_dprime=float(gmm_min_dprime),
+            target_ppc=float(target_particles_per_cell)
+        )
+    )
+    return res, (xedges, yedges, rho_map)
+
+# =============================================================================
+# Per-particle Voronoi local density (PBC) + robust bimodality (log-space, BIC)
+# =============================================================================
+import numpy as np
+from dataclasses import dataclass
+from typing import Tuple, Dict, Optional
+
+# freud has PBC Voronoi; fall back to grid if unavailable
+try:
+    import freud
+    HAS_FREUD = True
+except Exception:
+    HAS_FREUD = False
+
+from sklearn.mixture import GaussianMixture
+
+@dataclass
+class BimodalityResultV:
+    bimodal: bool
+    method: str                  # 'voronoi' or 'grid'
+    weights: Tuple[float, float] # (w_lo, w_hi) if bimodal else (1.0, 0.0)
+    means: Tuple[float, float]   # component means in *density* units (not log)
+    sigmas: Tuple[float, float]  # component stds (density units)
+    dprime: float                # Ashman-like separation in log-space
+    delta_bic: float             # BIC(1) - BIC(2), > 0 favors 2 comps
+    rho_mean: float
+    params: Dict[str, float]
+
+def voronoi_local_density_pbc(positions_xy: np.ndarray,
+                              box_length: Tuple[float, float]) -> np.ndarray:
+    """
+    Per-particle local density ρ_i = 1 / A_i where A_i is the Voronoi cell area
+    computed with *periodic* boundary conditions using freud.
+    Returns ρ_i with shape (N,).
+    """
+    if not HAS_FREUD:
+        raise RuntimeError("freud not available: cannot compute Voronoi local density with PBC.")
+    Lx, Ly = float(box_length[0]), float(box_length[1])
+    N = positions_xy.shape[0]
+    # freud box: 2D periodic in x,y; provide 3D with zero z-extent but periodic in xy only
+    box = freud.box.Box(Lx=Lx, Ly=Ly, Lz=1.0, is2D=True)
+    pts = np.zeros((N, 3), dtype=np.float64)
+    pts[:, :2] = positions_xy % np.array([Lx, Ly])
+    v = freud.locality.Voronoi()
+    v.compute((box, pts))
+    # polygon areas are in 2D; freud returns per-particle areas
+    areas = v.volumes  # shape (N,)
+    rho_local = 1.0 / areas
+    return rho_local
+
+def _gmm_bimodality_log(values: np.ndarray,
+                        min_weight: float = 0.02,
+                        min_dprime: float = 1.5,
+                        min_delta_bic: float = 6.0,
+                        random_state: int = 0) -> Tuple[bool, Dict[str, float]]:
+    """
+    Fit GMMs to log(values). Decide bimodality if:
+      - 2-component model has BIC at least 'min_delta_bic' better than 1-component, and
+      - both component weights >= min_weight, and
+      - separation d' >= min_dprime (on log scale).
+    Returns (decision, diagnostics dict).
+    """
+    x = np.asarray(values, dtype=np.float64)
+    x = x[np.isfinite(x) & (x > 0)]
+    if x.size < 200:
+        return False, {"n": float(x.size)}
+
+    lx = np.log(x).reshape(-1, 1)
+
+    g1 = GaussianMixture(n_components=1, covariance_type="full", random_state=random_state).fit(lx)
+    g2 = GaussianMixture(n_components=2, covariance_type="full", random_state=random_state).fit(lx)
+    bic1 = g1.bic(lx)
+    bic2 = g2.bic(lx)
+    delta_bic = bic1 - bic2  # >0 favors 2 components
+
+    w = g2.weights_.copy()
+    mu = g2.means_.ravel().copy()
+    s2 = np.array([np.squeeze(c) for c in g2.covariances_])
+    order = np.argsort(mu)
+    w = w[order]; mu = mu[order]; s2 = s2[order]
+
+    # Ashman-like separation on log scale
+    dprime = abs(mu[1] - mu[0]) / np.sqrt(0.5 * (s2[0] + s2[1]))
+
+    # Decision
+    bimodal = (delta_bic >= min_delta_bic) and (w.min() >= min_weight) and (dprime >= min_dprime)
+
+    # Back-transform means/sigmas to density units for reporting
+    mean_lo = float(np.exp(mu[0] + 0.5 * s2[0]))  # mean of lognormal
+    mean_hi = float(np.exp(mu[1] + 0.5 * s2[1]))
+    sigma_lo = float(np.sqrt((np.exp(s2[0]) - 1.0) * np.exp(2 * mu[0] + s2[0])))
+    sigma_hi = float(np.sqrt((np.exp(s2[1]) - 1.0) * np.exp(2 * mu[1] + s2[1])))
+
+    diag = {
+        "bic1": float(bic1), "bic2": float(bic2), "delta_bic": float(delta_bic),
+        "w_lo": float(w[0]), "w_hi": float(w[1]),
+        "mu_log_lo": float(mu[0]), "mu_log_hi": float(mu[1]),
+        "s2_log_lo": float(s2[0]), "s2_log_hi": float(s2[1]),
+        "dprime": float(dprime),
+        "mean_lo": mean_lo, "mean_hi": mean_hi,
+        "sigma_lo": sigma_lo, "sigma_hi": sigma_hi,
+    }
+    return bool(bimodal), diag
+
+def detect_liquid_gas_bimodality_nvt_voronoi(positions_xy: np.ndarray,
+                                             box_length: Tuple[float, float],
+                                             min_weight: float = 0.02,
+                                             min_dprime: float = 1.5,
+                                             min_delta_bic: float = 6.0,
+                                             random_state: int = 0) -> Tuple[BimodalityResultV, np.ndarray]:
+    """
+    Deterministic NVT detector based on per-particle Voronoi local density.
+    Robust to small minority phase fractions and avoids interface smearing.
+    Decision uses BIC(1) vs BIC(2) on log(ρ_i), plus weight and separation cuts.
+    Returns (result, rho_per_particle).
+    """
+    # Local densities from Voronoi (PBC)
+    rho_i = voronoi_local_density_pbc(positions_xy, box_length)
+    N = rho_i.size
+    Lx, Ly = float(box_length[0]), float(box_length[1])
+    rho_mean = N / (Lx * Ly)
+
+    ok, diag = _gmm_bimodality_log(rho_i,
+                                   min_weight=min_weight,
+                                   min_dprime=min_dprime,
+                                   min_delta_bic=min_delta_bic,
+                                   random_state=random_state)
+
+    if ok:
+        res = BimodalityResultV(
+            bimodal=True,
+            method="voronoi",
+            weights=(diag["w_lo"], diag["w_hi"]),
+            means=(diag["mean_lo"], diag["mean_hi"]),
+            sigmas=(diag["sigma_lo"], diag["sigma_hi"]),
+            dprime=diag["dprime"],
+            delta_bic=diag["delta_bic"],
+            rho_mean=float(rho_mean),
+            params=dict(min_weight=min_weight, min_dprime=min_dprime, min_delta_bic=min_delta_bic)
+        )
+    else:
+        res = BimodalityResultV(
+            bimodal=False,
+            method="voronoi",
+            weights=(1.0, 0.0),
+            means=(float(np.mean(rho_i)), float("nan")),
+            sigmas=(float(np.std(rho_i)), float("nan")),
+            dprime=float(diag.get("dprime", 0.0)),
+            delta_bic=float(diag.get("delta_bic", 0.0)),
+            rho_mean=float(rho_mean),
+            params=dict(min_weight=min_weight, min_dprime=min_dprime, min_delta_bic=min_delta_bic)
+        )
+    return res, rho_i
