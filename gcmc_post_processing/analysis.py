@@ -19,12 +19,13 @@ except Exception as e:
 # =============================================================================
 
 def _ensure_box(box_length):
-    """Return (Lx, Ly) and a freud.box.Box."""
+    """Return (Lx, Ly) and a 2D periodic freud.box.Box with Lz=1.0."""
     if isinstance(box_length, (float, int)):
         Lx, Ly = float(box_length), float(box_length)
     else:
         Lx, Ly = float(box_length[0]), float(box_length[1])
-    return (Lx, Ly), freud.box.Box(Lx=Lx, Ly=Ly)
+    return (Lx, Ly), freud.box.Box(Lx=Lx, Ly=Ly, Lz=1.0, is2D=True)
+
 
 
 def _to_3d(positions: np.ndarray) -> np.ndarray:
@@ -277,15 +278,27 @@ def fit_g6_auto(r, g6, rmin=None, rmax=None, start_bin=10, r2_margin=0.02):
         return G6Fit("exp", np.nan, float(r2p), float(r2e), float(rr.min()), float(rr.max()))
     return G6Fit("insufficient", np.nan, float(r2p), float(r2e), float(rr.min()), float(rr.max()))
 
+# =============================================================================
+# Hexatic–fluid–solid detector (robust): g6 models + Ψ6 sub-block scaling
+# =============================================================================
+# =============================================================================
+# Robust g6(r) envelope fit with hard floor on g6
+# =============================================================================
+import numpy as np
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-# =============================================================================
-# Robust g6 fitting: CONST vs POWER vs EXP with AIC + bootstrap
-# =============================================================================
+# ---------------------------------------------------------------------
+# analysis.py
+# ---------------------------------------------------------------------
+import numpy as np
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 @dataclass
 class G6ModelFit:
-    model: str             # 'const' | 'power' | 'exp' | 'undecided'
-    c_mean: float
+    model: str
+    c_tail: float
     eta6_mean: float
     eta6_std: float
     aic_const: float
@@ -295,97 +308,260 @@ class G6ModelFit:
     delta_to_next: float
     rmin: float
     rmax: float
-    bins_used: int
+    n_points: int
     rel_var: float
     tail_mean: float
-    notes: str
+    note: str
+    idx_used: np.ndarray
+    r_used: np.ndarray
+    y_used: np.ndarray
+    # NEW: store regression intercepts/slopes for plotting without re-fitting
+    logA_power: float        # b_p  in  log g6 = -η log r + b_p  → g6 = exp(b_p) r^{-η}
+    alpha_exp: float         # α    in  log g6 =  α r + b_e       → g6 = exp(α r + b_e)
+    logA_exp: float          # b_e
 
-def _weighted_linfit(x, y, w):
-    X = np.vstack([x, np.ones_like(x)]).T
-    W = np.diag(w)
-    XtW = X.T @ W
-    beta = np.linalg.lstsq(XtW @ X, XtW @ y, rcond=None)[0]
-    yhat = X @ beta
-    rss = float(np.sum(w * (y - yhat) ** 2))
-    return float(beta[0]), float(beta[1]), rss
+def _g6_upper_envelope(g6_avg: np.ndarray,
+                       g6_pf: Optional[np.ndarray],
+                       start_bin: int,
+                       q: float = 0.85,
+                       roll: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+    y = np.asarray(g6_avg, float)
+    i0 = max(0, int(start_bin))
+    idx_tail = np.arange(i0, len(y))
+    if g6_pf is not None and g6_pf.ndim == 2 and g6_pf.shape[1] == len(y):
+        y_env = np.quantile(np.maximum(g6_pf[:, i0:], 1e-16), q=q, axis=0)
+    else:
+        z = np.maximum(y[i0:], 1e-16)
+        if roll > 1:
+            pad = roll
+            zz = np.pad(z, (pad, pad), mode="edge")
+            y_env = np.maximum.reduce([zz[j:j+len(z)] for j in range(2*pad+1)])
+        else:
+            y_env = z
+    return np.asarray(y_env, float), idx_tail
 
-def _weighted_const(y, w):
-    c = float(np.sum(w * y) / np.sum(w))
-    rss = float(np.sum(w * (y - c) ** 2))
-    return c, rss
-
-def _aic_from_rss(rss, n, k):
-    rss = max(rss, 1e-30)
-    n = max(n, 1)
-    return float(n * np.log(rss / n) + 2 * k)
-
-def fit_g6_models(r, g6_avg, g6_per_frame, start_bin=10, n_boot=200, rng_seed=0):
+def fit_g6_models(
+    r: np.ndarray,
+    g6_avg: np.ndarray,
+    g6_pf: Optional[np.ndarray] = None,
+    start_bin: int = 20,
+    q_env: float = 0.85,
+    roll_env: int = 3,
+    y_floor: float = 1e-3,
+    y_cap: float = 1.0,
+    # keep backward-compat kwargs (ignored)
+    n_boot: int = 0,
+    rng_seed: int = 123,
+    **kwargs,
+) -> G6ModelFit:
     """
-    Fit CONST vs POWER vs EXP on a tail window and compare by AIC.
-    - Weights from per-frame SE
-    - Bootstrap η6 by resampling frames
+    AIC competition on the upper envelope of the tail (floor at y>=y_floor).
+    Stores intercepts so plotting doesn't reconstruct from ad-hoc points.
     """
     r = np.asarray(r, float)
-    y = np.maximum(np.asarray(g6_avg, float), 1e-16)
-    idx0 = min(start_bin, len(r))
-    rw, yw = r[idx0:], y[idx0:]
-    n = len(rw)
-    if n < 12:
-        return G6ModelFit('undecided', np.nan, np.nan, np.nan, np.inf, np.inf, np.inf,
-                          np.inf, 0.0, np.nan, np.nan, n, np.nan,
-                          float(np.mean(y[-max(3, len(y)//5):])) if len(y) else np.nan,
-                          "insufficient bins")
+    y = np.asarray(g6_avg, float)
 
-    # weights
-    if g6_per_frame is not None and g6_per_frame.shape[0] >= 2:
-        pf_tail = np.maximum(g6_per_frame[:, idx0:], 1e-16)  # (T, n)
-        se = np.std(pf_tail, axis=0, ddof=1) / np.sqrt(g6_per_frame.shape[0])
-        w = 1.0 / np.maximum(se, 1e-10) ** 2
+    # envelope & acceptance window
+    y_env, idx_tail = _g6_upper_envelope(g6_avg, g6_pf, start_bin, q=q_env, roll=roll_env)
+    r_tail = r[idx_tail]
+    mask = (r_tail > 0) & np.isfinite(y_env) & (y_env >= y_floor) & (y_env <= y_cap)
+    r_tail = r_tail[mask]; y_env = y_env[mask]
+
+    if r_tail.size < 6:
+        return G6ModelFit("exp", 0.0, np.nan, np.nan, 0, 0, 0, 0, 0,
+                          np.nan, np.nan, 0, 0.0, 0.0,
+                          f"insufficient tail after floor y>={y_floor:g}",
+                          idx_tail[mask], r_tail, y_env,
+                          logA_power=np.nan, alpha_exp=np.nan, logA_exp=np.nan)
+
+    lw = np.log(y_env)
+
+    # const (log g6 = c0)
+    c0 = float(np.mean(lw))
+    rss_c = float(np.sum((lw - c0)**2)); k_c = 1
+
+    # power (log g6 = -η log r + b_p)
+    Xp = np.vstack([np.log(r_tail), np.ones_like(r_tail)]).T
+    sp, bp = np.linalg.lstsq(Xp, lw, rcond=None)[0]
+    eta = -float(sp)         # slope is -η
+    logA_power = float(bp)
+    rss_p = float(np.sum((lw - (sp*np.log(r_tail) + bp))**2)); k_p = 2
+
+    # exp (log g6 = α r + b_e)
+    Xe = np.vstack([r_tail, np.ones_like(r_tail)]).T
+    se, be = np.linalg.lstsq(Xe, lw, rcond=None)[0]
+    alpha_exp = float(se); logA_exp = float(be)
+    rss_e = float(np.sum((lw - (se*r_tail + be))**2)); k_e = 2
+
+    def AIC(rss, n, k): return 2*k + n*np.log(max(rss, 1e-300)/n)
+    n = r_tail.size
+    aic_c = AIC(rss_c, n, k_c)
+    aic_p = AIC(rss_p, n, k_p)
+    aic_e = AIC(rss_e, n, k_e)
+    aics  = np.array([aic_c, aic_p, aic_e]); labels = np.array(["const","power","exp"])
+    order = np.argsort(aics); best = labels[order[0]]
+    delta = float(aics[order[1]] - aics[order[0]])
+
+    rel_var   = float((np.max(y_env) - np.min(y_env)) / max(np.mean(y_env), 1e-300))
+    tail_mean = float(np.mean(np.clip(y[-max(3, len(y)//5):], 1e-300, None)))
+
+    return G6ModelFit(
+        model=best,
+        c_tail=float(np.exp(c0)),
+        eta6_mean=float(eta),
+        eta6_std=float("nan"),
+        aic_const=float(aic_c),
+        aic_power=float(aic_p),
+        aic_exp=float(aic_e),
+        best_aic=float(aics[order[0]]),
+        delta_to_next=delta,
+        rmin=float(r_tail.min()),
+        rmax=float(r_tail.max()),
+        n_points=int(n),
+        rel_var=rel_var,
+        tail_mean=tail_mean,
+        note=f"upper-envelope q={q_env}, floor y>={y_floor:g}, cap y<={y_cap:g}",
+        idx_used=idx_tail[mask].copy(),
+        r_used=r_tail.copy(),
+        y_used=y_env.copy(),
+        logA_power=logA_power,
+        alpha_exp=alpha_exp,
+        logA_exp=logA_exp
+    )
+
+
+def psi6_subblock_scaling(
+    one_frame_xy: np.ndarray,
+    box_length: Tuple[float,float],
+    LB_over_L: Tuple[float,...] = (0.50, 0.40, 0.33, 0.25, 0.20, 0.167, 0.125,
+                                   0.10, 0.0833, 0.071, 0.0625, 0.05),
+    min_particles_per_block: int = 25
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Ψ6 sub-block scaling down to LB/L ≈ 0.05 with a per-block particle floor
+    to control noise at small blocks.
+    """
+    import freud
+    Lx, Ly = float(box_length[0]), float(box_length[1])
+    L = np.sqrt(Lx * Ly)
+    pts = one_frame_xy.copy()
+    # global Ψ6
+    box = freud.box.Box(Lx=Lx, Ly=Ly, Lz=1.0, is2D=True)
+    pts3 = np.pad(pts, ((0,0),(0,1)))
+    voro = freud.locality.Voronoi(); voro.compute((box, pts3))
+    op   = freud.order.Hexatic(k=6); op.compute((box, pts3), neighbors=voro.nlist)
+    psi2_global = float(np.abs(np.mean(op.particle_order))**2)
+
+    xs, ys = [], []
+    xfold = np.mod(pts[:,0], Lx); yfold = np.mod(pts[:,1], Ly)
+    for frac in LB_over_L:
+        LB = max(1e-9, frac * L)
+        # tile counts
+        nx = max(1, int(round(Lx / LB)))
+        ny = max(1, int(round(Ly / LB)))
+        dx, dy = Lx / nx, Ly / ny
+
+        ix = np.minimum((xfold/dx).astype(int), nx-1)
+        iy = np.minimum((yfold/dy).astype(int), ny-1)
+
+        psi2_list = []
+        for bx in range(nx):
+            for by in range(ny):
+                mask = (ix==bx) & (iy==by)
+                if np.count_nonzero(mask) < min_particles_per_block:
+                    continue
+                psub = np.pad(np.column_stack([xfold[mask], yfold[mask]]), ((0,0),(0,1)))
+                voro.compute((box, psub))
+                op.compute((box, psub), neighbors=voro.nlist)
+                psi2_list.append(np.abs(np.mean(op.particle_order))**2)
+        if psi2_global > 0 and len(psi2_list) > 0:
+            xs.append(dx / L)
+            ys.append(float(np.mean(psi2_list) / psi2_global))
+    return np.asarray(xs), np.asarray(ys)
+
+
+# --- Fused decision: use g6 models + Ψ6 sub-block scaling ---
+@dataclass
+class HexaticDecision:
+    phase: str                 # 'fluid' | 'hexatic' | 'solid' | 'transition'
+    reason: str
+    eta6_mean: float
+    eta6_std: float
+    psi6_abs_mean: float
+    U4: float
+    chi6: float
+    tail_mean: float
+    x_sub: np.ndarray          # LB/L
+    y_sub: np.ndarray          # Ψ6^2(LB)/Ψ6^2(L)
+    fit: G6ModelFit
+
+def classify_hexatic_fluid_solid(frames_xy: Sequence[np.ndarray],
+                                 box_length: Tuple[float,float],
+                                 n_particles: int,
+                                 rmax_frac: float = 0.45,
+                                 nbins: int = 140,
+                                 start_bin: int = 25,
+                                 aic_margin: float = 4.0,
+                                 eta_hex: float = 0.25,
+                                 eta_margin: float = 0.02,
+                                 tail_liquid_cut: float = 2e-1,
+                                 psi6_solid_min: float = 0.50,
+                                 subblock_x: Sequence[float]=(0.5,0.4,0.33,0.25,0.2),
+                                 n_boot: int = 300,
+                                 rng_seed: int = 123) -> HexaticDecision:
+    """
+    Deterministic KTHNY-compatible classifier.
+      • g6(r): const vs power vs exp (AIC, bootstrap η6).
+      • Ψ6 sub-block scaling: curve above (LB/L)^{-1/4} ⇒ >= hexatic; below ⇒ liquid.  # :contentReference[oaicite:2]{index=2}
+    """
+    # 1) g6(r)
+    (Lx, Ly) = float(box_length[0]), float(box_length[1])
+    # from .analysis import compute_g6_avg, compute_psi6_series, binder_and_susceptibility  # if inside a package, adjust import
+    r, g6_avg, g6_pf = compute_g6_avg(frames_xy, box_length, r_max=rmax_frac*min(Lx,Ly),
+                                      nbins=nbins, return_per_frame=True)
+    fit = fit_g6_models(r, g6_avg, g6_pf, start_bin=start_bin, n_boot=n_boot, rng_seed=rng_seed)
+
+    # 2) global Ψ6, Binder, χ6
+    psi6_series, psi6_abs_mean, _ = compute_psi6_series(frames_xy, box_length, order_k=6)
+    U4, chi6 = binder_and_susceptibility(psi6_series, n_particles)
+
+    # 3) Ψ6 sub-block scaling on a representative frame (middle frame)
+    k = len(frames_xy)//2
+    x_sub, y_sub = psi6_subblock_scaling(frames_xy[k][:,:2], (Lx, Ly), LB_over_L=subblock_x)
+
+    # reference line (LB/L)^(-1/4) – compare mean log residual
+    if len(x_sub) >= 3:
+        ref = np.power(x_sub, -0.25)  # separates liquid from hexatic/solid in scaling plot.  # :contentReference[oaicite:3]{index=3}
+        above_frac = float(np.mean(y_sub >= ref))
     else:
-        w = np.ones(n, float)
+        ref = np.array([]); above_frac = np.nan
 
-    rel_var = float((np.max(yw) - np.min(yw)) / max(np.mean(yw), 1e-16))
-    tail_mean = float(np.mean(y[-max(3, len(y)//5):])) if len(y) else np.nan
+    # 4) fused rules
+    # liquid: exp g6 or small tail + scaling below ref
+    if (fit.model == "exp" and fit.delta_to_next >= aic_margin) or (fit.tail_mean < tail_liquid_cut):
+        if np.isnan(above_frac) or (above_frac < 0.5):
+            reason = "g6: exponential (or small tail) and Ψ6-scaling below ref"
+            return HexaticDecision("fluid", reason, fit.eta6_mean, fit.eta6_std, psi6_abs_mean, U4, chi6,
+                                   fit.tail_mean, x_sub, y_sub, fit)
 
-    # const
-    c_mean, rss_c = _weighted_const(yw, w)
-    aic_c = _aic_from_rss(rss_c, n, k=1)
+    # solid: const g6 or very small η6 + strong global |Ψ6|
+    if (fit.model == "const" and fit.delta_to_next >= aic_margin) or \
+       ((fit.eta6_mean <= 0.05) and (fit.tail_mean >= 0.3) and (psi6_abs_mean >= psi6_solid_min)):
+        reason = "g6: nearly constant / η6≈0 with strong |Ψ6|"
+        return HexaticDecision("solid", reason, fit.eta6_mean, fit.eta6_std, psi6_abs_mean, U4, chi6,
+                               fit.tail_mean, x_sub, y_sub, fit)
 
-    # power
-    sp, ip, rss_p = _weighted_linfit(np.log(rw), np.log(yw), w)
-    eta_hat = -sp
-    aic_p = _aic_from_rss(rss_p, n, k=2)
+    # hexatic: power-law with η6 < 1/4 (clear AIC win) and scaling above ref
+    if (fit.model == "power" and fit.delta_to_next >= aic_margin and (fit.eta6_mean < (eta_hex - eta_margin))):
+        if np.isnan(above_frac) or (above_frac >= 0.5):
+            reason = "g6: algebraic with η6<1/4 and Ψ6-scaling above ref"
+            return HexaticDecision("hexatic", reason, fit.eta6_mean, fit.eta6_std, psi6_abs_mean, U4, chi6,
+                                   fit.tail_mean, x_sub, y_sub, fit)
 
-    # exp
-    se, ie, rss_e = _weighted_linfit(rw, np.log(yw), w)
-    aic_e = _aic_from_rss(rss_e, n, k=2)
-
-    aics = np.array([aic_c, aic_p, aic_e])
-    labels = np.array(["const", "power", "exp"])
-    order = np.argsort(aics)
-    best = labels[order[0]]
-    best_aic = float(aics[order[0]])
-    delta_to_next = float(aics[order[1]] - aics[order[0]])
-
-    # bootstrap η6
-    rng = np.random.default_rng(rng_seed)
-    etas = []
-    if g6_per_frame is not None and g6_per_frame.shape[0] >= 5:
-        T = g6_per_frame.shape[0]
-        for _ in range(int(n_boot)):
-            pick = rng.integers(0, T, size=T)
-            g_bs = np.maximum(g6_per_frame[pick][:, idx0:].mean(axis=0), 1e-16)
-            sb, ib, _ = _weighted_linfit(np.log(rw), np.log(g_bs), np.ones_like(g_bs))
-            etas.append(-sb)
-    eta_mean = float(np.mean(etas)) if len(etas) else float(eta_hat)
-    eta_std = float(np.std(etas, ddof=1)) if len(etas) > 1 else np.nan
-
-    return G6ModelFit(best, float(c_mean), eta_mean, eta_std,
-                      float(aic_c), float(aic_p), float(aic_e),
-                      best_aic, delta_to_next,
-                      float(rw.min()), float(rw.max()), int(n),
-                      rel_var, tail_mean,
-                      "const vs power vs exp; weighted; bootstrap eta6")
+    # boundary / ambiguous: near η6≈1/4 or conflicting signals
+    reason = "near thresholds (η6≈1/4) or g6/Ψ6 scaling disagree"
+    return HexaticDecision("transition", reason, fit.eta6_mean, fit.eta6_std, psi6_abs_mean, U4, chi6,
+                           fit.tail_mean, x_sub, y_sub, fit)
 
 
 # =============================================================================
@@ -577,7 +753,7 @@ def scan_and_classify_orientational_robust(dataset, box_length, n_particles, key
             "delta_to_next": pr.fit.delta_to_next,
             "fit_rmin": pr.fit.rmin,
             "fit_rmax": pr.fit.rmax,
-            "bins_used": pr.fit.bins_used,
+            "bins_used": pr.fit.n_points,
             "rel_var": pr.fit.rel_var,
             "tail_mean_g6": pr.fit.tail_mean,
         })

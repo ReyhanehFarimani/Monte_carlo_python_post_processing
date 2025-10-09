@@ -401,3 +401,54 @@ def plot_density_histogram(ax, rho_map, bins=100):
     ax.set_xlabel(r'local density $\rho$')
     ax.set_ylabel('PDF')
     ax.grid(True)
+
+
+def overlay_fit_on_g6(ax, r, g6_avg, fit, y_floor=1e-3, y_cap=1.0):
+    """
+    Log–log plot of g6 with envelope-fit overlay.
+    Always shows y-range [1e-3, 1].
+    """
+    r = np.asarray(r, float)
+    y = np.asarray(g6_avg, float)
+    y = np.clip(y, y_floor, y_cap)
+
+    # raw
+    ax.loglog(r, y, 'o-', ms=3, lw=1.0, color='C0', alpha=0.7, label=r'$g_6(r)$ avg')
+
+    # points used for fit
+    if hasattr(fit, "r_used") and hasattr(fit, "y_used") and len(fit.r_used) > 0:
+        ax.loglog(fit.r_used, np.clip(fit.y_used, y_floor, y_cap),
+                  'o', ms=4, color='C3', label='fit pts (upper envelope)')
+
+    # domain
+    rmin = max(fit.rmin, np.min(r[r > 0]))
+    rmax = min(fit.rmax, np.max(r))
+    if rmax <= rmin:
+        rmin, rmax = np.min(r[r > 0]), np.max(r)
+    rr = np.geomspace(max(rmin, 1e-12), rmax, 256)
+
+    # const
+    ax.loglog(rr, np.clip(0*rr + fit.c_tail, y_floor, y_cap),
+              '-', color='0.5', lw=1.2, alpha=0.8, label='const')
+
+    # power
+    if np.isfinite(getattr(fit, "eta6_mean", np.nan)):
+        if hasattr(fit, "r_used") and len(fit.r_used) > 0:
+            A = float(fit.y_used[0] * (fit.r_used[0] ** fit.eta6_mean))
+        else:
+            A = float(y[-1] * (r[-1] ** fit.eta6_mean))
+        ax.loglog(rr, np.clip(A * rr**(-fit.eta6_mean), y_floor, y_cap),
+                  '-', color='C2', lw=1.6, label=fr'power (η₆≈{fit.eta6_mean:.3f})')
+
+    # exp (re-fit for display)
+    if hasattr(fit, "r_used") and len(fit.r_used) >= 2:
+        lw = np.log(np.clip(fit.y_used, y_floor, None))
+        X  = np.vstack([fit.r_used, np.ones_like(fit.r_used)]).T
+        se, be = np.linalg.lstsq(X, lw, rcond=None)[0]
+        ax.loglog(rr, np.clip(np.exp(se*rr + be), y_floor, y_cap),
+                  '-', color='C1', lw=1.6, label='exp')
+
+    ax.set_xlabel('r'); ax.set_ylabel(r'$g_6(r)$')
+    ax.set_ylim(y_floor, y_cap)          # <---- fixed y-range [1e-3, 1]
+    ax.grid(True, which='both', alpha=0.3)
+    ax.legend(loc='best', fontsize=8)
