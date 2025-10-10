@@ -535,3 +535,76 @@ def plot_structure_factor_2d(kx: np.ndarray, ky: np.ndarray, S: np.ndarray,
         ax.set_ylim(ylim)  # limits in kx
 
     return ax
+
+# ===============================
+# Translational: c(r) visualization
+# ===============================
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_cG_curve(
+    r: np.ndarray,
+    c_avg: np.ndarray,
+    fit,                        # FitCGResult from analysis.fit_cG_models / fit_cG_auto
+    *,
+    y_std: np.ndarray | None = None,
+    y_floor: float = 1e-12,
+    y_cap: float = 1.0,
+    title: str | None = None,
+):
+    """
+    Log–log plot of |c(r)| with optional ±1σ band and model overlays (const/power/exp).
+    Returns matplotlib Axes.
+    """
+    r = np.asarray(r, float)
+    y = np.clip(np.asarray(c_avg, float), y_floor, y_cap)
+
+    fig, ax = plt.subplots(figsize=(4.8, 3.6), constrained_layout=True)
+    # 1σ band if provided
+    if y_std is not None:
+        ylo = np.clip(y - y_std, y_floor, y_cap)
+        yhi = np.clip(y + y_std, y_floor, y_cap)
+        ax.fill_between(r, ylo, yhi, color='C0', alpha=0.18, lw=0)
+
+    # averaged curve
+    ax.loglog(r, y, 'o-', ms=3, lw=1.1, color='C0', alpha=0.85, label=r'$\langle |c(r)| \rangle$')
+
+    # points actually used by the fit
+    if getattr(fit, "r_used", None) is not None and len(fit.r_used) > 0:
+        ax.loglog(fit.r_used, np.clip(fit.y_used, y_floor, y_cap),
+                  'o', ms=4, color='C3', alpha=0.9, label='fit pts')
+
+    # overlays (on r∈[rmin, rmax])
+    rr_all = r[(r > 0)]
+    if rr_all.size == 0:
+        rr_all = np.geomspace(1e-6, 1.0, 64)
+    rmin = float(getattr(fit, "rmin", np.nan))
+    rmax = float(getattr(fit, "rmax", np.nan))
+    if np.isfinite(rmin) and np.isfinite(rmax) and rmax > rmin:
+        rr = np.geomspace(max(rmin, 1e-12), rmax, 256)
+    else:
+        rr = np.geomspace(max(rr_all.min(), 1e-12), rr_all.max(), 256)
+
+    # const overlay
+    if np.isfinite(getattr(fit, "c_tail", np.nan)):
+        ax.loglog(rr, np.clip(0*rr + float(fit.c_tail), y_floor, y_cap),
+                  '-', color='0.5', lw=1.1, alpha=0.9, label='const')
+
+    # power overlay
+    if np.isfinite(getattr(fit, "etaG_mean", np.nan)) and np.isfinite(getattr(fit, "logA_power", np.nan)):
+        A = float(np.exp(fit.logA_power))
+        ax.loglog(rr, np.clip(A * rr**(-fit.etaG_mean), y_floor, y_cap),
+                  '-', color='C2', lw=1.6, label=fr'power (η_G≈{fit.etaG_mean:.3f})')
+
+    # exponential overlay
+    if np.isfinite(getattr(fit, "alpha_exp", np.nan)) and np.isfinite(getattr(fit, "logA_exp", np.nan)):
+        ax.loglog(rr, np.clip(np.exp(fit.alpha_exp * rr + fit.logA_exp), y_floor, y_cap),
+                  '-', color='C1', lw=1.6, label='exp')
+
+    ax.set_xlabel('r'); ax.set_ylabel(r'$|c(r)|$')
+    ax.set_ylim(y_floor, y_cap)
+    if title:
+        ax.set_title(title)
+    ax.grid(True, which='both', alpha=0.3)
+    ax.legend(loc='best', fontsize=8, frameon=False)
+    return ax

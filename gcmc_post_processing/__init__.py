@@ -49,13 +49,27 @@ from .analysis import (
     # maps
     compute_psi_density,
 
-    # translational (stubs for now)
+    # translational (legacy stubs)
     compute_gG,
     sub_system_translational,
 
     # --- structure-factor pipelines
     compute_and_save_structure_factor,         # 1D radial S(q)
     compute_and_save_structure_factor_2d,      # 2D S(kx,ky)
+    fit_cG_models, fit_cG_auto, FitCGResult,compute_cG_avg,
+)
+
+# -----------------------------------------------------------------------------
+# translational order (public API)
+# -----------------------------------------------------------------------------
+from .analysis import (
+    psi_G,                         # global Ψ_G for a chosen G-vector
+    compute_c_of_r,                # translational correlation c(r)
+    psiG_subblock_scaling,         # Ψ_G sub-block scaling
+    select_G_from_Sk,              # pick first-shell Bragg vector from S(k)
+    classify_translational,        # rule-based solid/hexatic/fluid decision
+    GVector,                       # dataclass: selected G and metadata
+    TranslationalDecision,         # dataclass: classifier output
 )
 
 # -----------------------------------------------------------------------------
@@ -81,6 +95,8 @@ from .visualization import (
     # --- structure-factor plots
     plot_structure_factor,          # 1D S(q)
     plot_structure_factor_2d,       # 2D S(kx,ky)
+    
+    plot_cG_curve,
 )
 
 # -----------------------------------------------------------------------------
@@ -156,8 +172,19 @@ __all__ = [
     "scan_and_classify_orientational",
     "scan_and_classify_orientational_robust",
     "compute_psi_density",
+
+    # translational (legacy stubs)
     "compute_gG",
     "sub_system_translational",
+
+    # translational (new public API)
+    "psi_G",
+    "compute_c_of_r",
+    "psiG_subblock_scaling",
+    "select_G_from_Sk",
+    "classify_translational",
+    "GVector",
+    "TranslationalDecision",
 
     # visualization
     "plot_data",
@@ -201,4 +228,9 @@ __all__ = [
     "extract_q_vectors_from_S2D",
     "extract_first_shell_q_vectors",
     "extract_q_vectors_from_S2D",
+    "fit_cG_models",
+    "fit_cG_auto",
+    "FitCGResult",
+    "plot_cG_curve",
+    "compute_cG_avg",
 ]

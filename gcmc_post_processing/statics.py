@@ -772,4 +772,6 @@ def extract_q_vectors_from_S2D(
 
     qvecs = np.column_stack([qx0, qy0])
     return dict(qvecs=qvecs, q=kmag, S=Svals, ij=np.column_stack([pi, pj]))
-# --- end patch ---
+
+
+
