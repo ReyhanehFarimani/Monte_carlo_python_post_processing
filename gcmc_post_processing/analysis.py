@@ -1271,3 +1271,89 @@ def detect_liquid_gas_bimodality_nvt_voronoi(positions_xy: np.ndarray,
             params=dict(min_weight=min_weight, min_dprime=min_dprime, min_delta_bic=min_delta_bic)
         )
     return res, rho_i
+
+
+
+from pathlib import Path
+import numpy as np
+
+from .statics import structure_factor, structure_factor_from_gr
+from .visualization import plot_structure_factor
+from .utils import save_table_csv
+
+def compute_and_save_structure_factor(
+    positions: np.ndarray,
+    box: tuple,
+    outdir: str,
+    tag: str = "frame0000",
+    kmax: float = None,
+    nbins: int = 200,
+    save_figure: bool = True
+):
+    """
+    Full pipeline: compute S(k)->S(q), save CSV and optional PNG.
+    Outputs:
+      outdir/Sq_{tag}.csv with columns [q, S(q)]
+      outdir/Sq_{tag}.png
+    """
+    out = structure_factor(positions=positions, box=box, kmax=kmax, nbins=nbins)
+    outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
+    csv_path = outdir / f"Sq_{tag}.csv"
+    save_table_csv(csv_path, [out.q, out.Sq], header=["q", "S(q)"])
+
+    if save_figure:
+        import matplotlib.pyplot as plt
+        ax = plot_structure_factor(out.q, out.Sq)
+        fig = ax.figure
+        fig.savefig(outdir / f"Sq_{tag}.png", dpi=300)
+        plt.close(fig)
+
+    # return full result for further analysis
+    return out
+
+
+from pathlib import Path
+import numpy as np
+from .statics import structure_factor_2d
+from .visualization import plot_structure_factor_2d
+from .utils import save_table_csv
+
+def compute_and_save_structure_factor_2d(
+    positions: np.ndarray,
+    box: tuple,
+    outdir: str,
+    tag: str = "frame0000",
+    nmax: int = 64,
+    log10: bool = True,
+    save_npz: bool = True,
+    save_csv: bool = False,
+    save_png: bool = True,
+):
+    """
+    Full pipeline for 2D S(kx,ky). Saves:
+      - NPZ (kx, ky, S) for lossless reuse,
+      - optionally long-form CSV (kx, ky, S),
+      - PNG heatmap (log10 by default).
+    """
+    out = structure_factor_2d(positions=positions, box=box, nmax=nmax)
+    outpath = Path(outdir); outpath.mkdir(parents=True, exist_ok=True)
+
+    if save_npz:
+        np.savez_compressed(outpath / f"S2D_{tag}.npz", kx=out.kx, ky=out.ky, S=out.S, meta=out.meta)
+
+    if save_csv:
+        # long-form CSV: one row per pixel
+        KX, KY = np.meshgrid(out.kx, out.ky, indexing="ij")
+        save_table_csv(outpath / f"S2D_{tag}.csv",
+                       [KX.ravel(), KY.ravel(), out.S.ravel()],
+                       header=["kx", "ky", "S"])
+
+    if save_png:
+        import matplotlib.pyplot as plt
+        ax = plot_structure_factor_2d(out.kx, out.ky, out.S, log10=log10,
+                                      title=f"S(kx,ky) {tag}")
+        ax.figure.savefig(outpath / f"S2D_{tag}.png", dpi=300)
+        plt.close(ax.figure)
+
+    return out
+

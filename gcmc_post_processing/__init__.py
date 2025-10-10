@@ -1,6 +1,6 @@
 """
 Reyhaneh — package init
-Updated: 15 Sep 2025
+Updated: 10 Oct 2025
 """
 
 # -----------------------------------------------------------------------------
@@ -52,6 +52,10 @@ from .analysis import (
     # translational (stubs for now)
     compute_gG,
     sub_system_translational,
+
+    # --- structure-factor pipelines
+    compute_and_save_structure_factor,         # 1D radial S(q)
+    compute_and_save_structure_factor_2d,      # 2D S(kx,ky)
 )
 
 # -----------------------------------------------------------------------------
@@ -73,20 +77,27 @@ from .visualization import (
     plot_binder_scalar,
     plot_chi6_scalar,
     plot_g6_curve,
+
+    # --- structure-factor plots
+    plot_structure_factor,          # 1D S(q)
+    plot_structure_factor_2d,       # 2D S(kx,ky)
 )
 
 # -----------------------------------------------------------------------------
-# utilities (generators)
+# utilities (generators + io helpers)
 # -----------------------------------------------------------------------------
 from .utils import (
     generate_fake_crystal_structure,
     generate_fake_triangular_lattice,
     generate_fake_triangular_lattice_defected,
     generate_random_particles,
+
+    # --- io helper used by structure-factor pipelines
+    save_table_csv,
 )
 
 # -----------------------------------------------------------------------------
-# statics / helpers
+# statics / helpers (incl. structure factor core)
 # -----------------------------------------------------------------------------
 from .statics import (
     extract_mu_and_temperature,
@@ -94,7 +105,24 @@ from .statics import (
     read_simulation_input,
     process_simulation_data,
     bin_data_by_density,
+
+    # --- structure-factor core API (1D + 2D)
+    StructureFactorResult,          # 1D
+    structure_factor,               # 1D
+    structure_factor_from_gr,       # 1D (from g(r))
+    StructureFactor2DResult,        # 2D
+    structure_factor_2d,            # 2D
+    extract_q_vectors_from_S2D,
+    extract_first_shell_q_vectors,
+    extract_q_vectors_from_S2D,
 )
+
+# -----------------------------------------------------------------------------
+# back-compat aliases / shims
+# -----------------------------------------------------------------------------
+# Keep the historical misspelling importable to avoid breakage.
+# Users may have: from pkg import classify_orientional_phase_rules
+classify_orientional_phase_rules = classify_orientational_phase_rules  # noqa: E305
 
 # -----------------------------------------------------------------------------
 # public api
@@ -122,7 +150,7 @@ __all__ = [
     "fit_g6_auto",
     "fit_g6_models",
     "classify_orientational_phase",
-    "classify_orientional_phase_rules",  # kept for compatibility if referenced elsewhere
+    "classify_orientional_phase_rules",   # back-compat alias
     "classify_orientational_phase_rules",
     "scan_by_density_or_mu",
     "scan_and_classify_orientational",
@@ -145,12 +173,15 @@ __all__ = [
     "plot_binder_scalar",
     "plot_chi6_scalar",
     "plot_g6_curve",
+    "plot_structure_factor",        # 1D
+    "plot_structure_factor_2d",     # 2D
 
     # utils
     "generate_fake_crystal_structure",
     "generate_fake_triangular_lattice",
     "generate_fake_triangular_lattice_defected",
     "generate_random_particles",
+    "save_table_csv",
 
     # statics
     "extract_mu_and_temperature",
@@ -158,4 +189,16 @@ __all__ = [
     "read_simulation_input",
     "process_simulation_data",
     "bin_data_by_density",
+
+    # structure factor core + pipelines
+    "StructureFactorResult",
+    "structure_factor",
+    "structure_factor_from_gr",
+    "StructureFactor2DResult",
+    "structure_factor_2d",
+    "compute_and_save_structure_factor",
+    "compute_and_save_structure_factor_2d",
+    "extract_q_vectors_from_S2D",
+    "extract_first_shell_q_vectors",
+    "extract_q_vectors_from_S2D",
 ]

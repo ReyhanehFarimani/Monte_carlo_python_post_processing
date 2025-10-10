@@ -166,3 +166,24 @@ def generate_random_particles(num_particles=100, box_size=(10.0, 10.0), output_f
             file.write(f"C {pos[0]:.5f} {pos[1]:.5f} {pos[2]:.5f}\n")
     
     print(f"Random particle distribution written to {output_file}")
+    
+    
+# --- begin patch: add to utils.py ---
+
+import numpy as np
+from pathlib import Path
+
+def save_table_csv(path, columns, header=None):
+    """
+    Save columns (list of 1D arrays) to CSV with optional header list.
+    """
+    path = Path(path)
+    data = np.column_stack(columns)
+    if header is None:
+        np.savetxt(path, data, delimiter=",")
+    else:
+        header_line = ",".join(header)
+        np.savetxt(path, data, delimiter=",", header=header_line, comments="")
+    return str(path)
+
+# --- end patch ---

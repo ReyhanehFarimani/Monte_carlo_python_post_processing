@@ -452,3 +452,86 @@ def overlay_fit_on_g6(ax, r, g6_avg, fit, y_floor=1e-3, y_cap=1.0):
     ax.set_ylim(y_floor, y_cap)          # <---- fixed y-range [1e-3, 1]
     ax.grid(True, which='both', alpha=0.3)
     ax.legend(loc='best', fontsize=8)
+
+
+
+def plot_structure_factor(q: np.ndarray, Sq: np.ndarray, *, ax=None, annotate_peak: bool = True, peak_min_prom=0.1):
+    """
+    Plot S(q) with optional first-peak annotation.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(4.0, 3.0), constrained_layout=True)
+    ax.plot(q, Sq, lw=1.6, color="C0")
+    ax.set_xlabel(r"$q$")
+    ax.set_ylabel(r"$S(q)$")
+    ax.grid(True, alpha=0.3)
+    if annotate_peak and len(q) > 10:
+        try:
+            from scipy.signal import find_peaks
+            pk, props = find_peaks(Sq, prominence=peak_min_prom)
+            if pk.size > 0:
+                j = pk[np.argmax(Sq[pk])]
+                ax.axvline(q[j], ls="--", lw=1.0, color="C1", alpha=0.7)
+                ax.annotate(fr"$q^\ast={q[j]:.3f}$", (q[j], Sq[j]),
+                            xytext=(5, 10), textcoords="offset points",
+                            color="C1", ha="left", va="bottom", fontsize=9)
+        except Exception:
+            pass
+    return ax
+
+
+
+def plot_structure_factor_2d(kx: np.ndarray, ky: np.ndarray, S: np.ndarray,
+                             *, ax=None, log10: bool = True,
+                             vmin=None, vmax=None,  # can be numbers or percentiles (e.g., "p1","p99")
+                             cmap="magma", colorbar=True, title=None,
+                             xlim=None, ylim=None):
+    """
+    Heatmap of S(kx,ky). Supports zoom via xlim/ylim (in k-units) and
+    percentile-based contrast via vmin/vmax strings: "p1","p5","p95","p99".
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(4.2, 4.0), constrained_layout=True)
+    KX, KY = np.meshgrid(kx, ky, indexing="ij")
+
+    A = np.array(S, dtype=float)
+    if log10:
+        with np.errstate(invalid="ignore"):
+            A = np.log10(A)
+
+    # Percentile contrast (if vmin/vmax passed like "p1","p99")
+    def _parse_p(v, arr):
+        if isinstance(v, str) and v.startswith("p"):
+            p = float(v[1:])
+            return np.nanpercentile(arr, p)
+        return v
+    vmin = _parse_p(vmin, A)
+    vmax = _parse_p(vmax, A)
+
+    # imshow expects extents along displayed axes
+    extent = [ky.min(), ky.max(), kx.min(), kx.max()]  # x=ky, y=kx
+    im = ax.imshow(A, origin="lower", extent=extent, cmap=cmap,
+                   vmin=vmin, vmax=vmax, aspect="equal")
+
+    ax.set_xlabel(r"$k_y$")
+    ax.set_ylabel(r"$k_x$")
+    if title:
+        ax.set_title(title)
+    if colorbar:
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(r"$\log_{10} S(\mathbf{k})$" if log10 else r"$S(\mathbf{k})$")
+
+    # crosshairs at k=0
+    ax.axhline(0, color="w", alpha=0.4, lw=0.6)
+    ax.axvline(0, color="w", alpha=0.4, lw=0.6)
+
+    # Apply zoom (note: displayed x-axis is ky, y-axis is kx)
+    if xlim is not None:
+        ax.set_xlim(xlim)  # limits in ky
+    if ylim is not None:
+        ax.set_ylim(ylim)  # limits in kx
+
+    return ax
