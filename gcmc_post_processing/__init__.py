@@ -234,3 +234,28 @@ __all__ = [
     "plot_cG_curve",
     "compute_cG_avg",
 ]
+
+# -----------------------------------------------------------------------------
+# Gibbs ensemble analysis
+# -----------------------------------------------------------------------------
+from .gibbs_io import (
+    GibbsTwoBoxLoader,
+    LAMMPSDumpReader,
+    DataFileReader,
+    GibbsDumpPair,
+    Box,
+    GibbsFrame,
+    DumpFrame,
+    DataRecord,
+)
+
+__all__ += [
+    "GibbsTwoBoxLoader",
+    "LAMMPSDumpReader",
+    "DataFileReader",
+    "GibbsDumpPair",
+    "Box",
+    "GibbsFrame",
+    "DumpFrame",
+    "DataRecord",
+]
