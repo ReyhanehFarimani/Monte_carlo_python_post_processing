@@ -239,23 +239,67 @@ __all__ = [
 # Gibbs ensemble analysis
 # -----------------------------------------------------------------------------
 from .gibbs_io import (
-    GibbsTwoBoxLoader,
-    LAMMPSDumpReader,
-    DataFileReader,
-    GibbsDumpPair,
-    Box,
-    GibbsFrame,
-    DumpFrame,
-    DataRecord,
+Box,
+DumpFrame,
+GibbsFrame,
+DataRecord,
+LAMMPSDumpReader,
+GibbsDumpPair,
+DataFileReader,
+GibbsTwoBoxLoader,
+load_gibbs,
+iter_gibbs,
+index_datafile,
 )
 
+
+from .gibbs_analysis import (
+collect_reduced_nv_for_folder,
+collect_reduced_nv_across,
+set_plot_style,
+plot_reduced_nv_scatter,
+analyze_and_plot_reduced_nv,
+# coexistence detection
+collect_local_densities_for_folder,
+collect_local_densities_for_pattern,
+estimate_coexistence_from_rho,
+CoexistenceResult,
+plot_density_histogram_with_peaks,
+plot_density_detection,
+parse_density_from_name,
+detect_coexistence_for_pattern,
+)
+
+
 __all__ += [
-    "GibbsTwoBoxLoader",
-    "LAMMPSDumpReader",
-    "DataFileReader",
-    "GibbsDumpPair",
-    "Box",
-    "GibbsFrame",
-    "DumpFrame",
-    "DataRecord",
+# Core data structures
+"Box",
+"DumpFrame",
+"GibbsFrame",
+"DataRecord",
+# Readers
+"LAMMPSDumpReader",
+"GibbsDumpPair",
+"DataFileReader",
+"GibbsTwoBoxLoader",
+# Convenience helpers
+"load_gibbs",
+"iter_gibbs",
+"index_datafile",
+# Gibbs analysis
+"collect_reduced_nv_for_folder",
+"collect_reduced_nv_across",
+"set_plot_style",
+"plot_reduced_nv_scatter",
+"analyze_and_plot_reduced_nv",
+# coexistence detection
+"collect_local_densities_for_folder",
+"collect_local_densities_for_pattern",
+"estimate_coexistence_from_rho",
+"CoexistenceResult",
+"plot_density_histogram_with_peaks",
+"estimate_coexistence_from_rho_ref",
+"plot_density_detection",
+"parse_density_from_name",
+"detect_coexistence_for_pattern",
 ]
